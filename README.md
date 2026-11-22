@@ -180,6 +180,35 @@ the ceiling a bit above the speed you actually get:
 The hardware encodes rates as MAN × 10^EXP kbit/s: 1 Mbit/s steps up to 127, 10 Mbit/s steps up to 1270, then 100 Mbit/s
 steps.
 
+### Choosing the ceiling
+
+`--cir` sets the ceiling to 125% of CIR by default. On a 300/30 DOCSIS line whose real sustained rate was only about
+340–345 Mbit/s, that put the ceiling (375) above what the line could actually carry: the controller parked up near
+the ceiling with a standing modem queue just under the cut threshold, and rarely cut.
+
+Measure your line's sustained loaded rate and set `--ceil` just above it, instead of trusting the 125% default. On
+the test line the right ceiling turned out to be about 113–116% of CIR: `--ceil 348` (the rate itself still only
+moves in 10 Mbit/s hardware steps, so it capped out at 340).
+
+8-stream loaded download, 90 s runs, same line:
+
+| Ceiling | % of CIR | Throughput (mean) | Latency p95 | Latency p99 (range) | Cuts per run |
+|---|---|---|---|---|---|
+| 375 (default `--cir 300`) | 125% | ~321 Mbit/s | ~36.6 ms | 38–61 ms | 2–5 |
+| 348 | 116% | 306 Mbit/s | 30.6 ms | 32–36 ms | 0 |
+| 330 | 110% | 295 Mbit/s | 29.4 ms | 31–37 ms | 0–1 |
+
+Single-stream downloads were too noisy in this test to tell the three ceilings apart; the 8-stream numbers above are
+the ones that separate cleanly.
+
+Override the ceiling alongside `--cir` with an explicit `--ceil`:
+
+```
+option args '--cir 300 --ceil 348'
+```
+
+(`--ceil` overrides only the ceiling; floor and start still come from `--cir`.)
+
 ## Building
 
 GitHub Actions builds both packages with `openwrt/gh-action-sdk` and the 25.12.6 `mediatek-filogic` SDK image, and runs
