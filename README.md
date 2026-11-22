@@ -9,8 +9,9 @@ latency passively from normal traffic, with no pings or scripts, and a small con
 limiter on the fly. On my 300 megabit cable line it gets about 335 megabits, where CAKE gets about 285, with the same low
 latency. It uses almost no CPU, starts at boot, and recovers on its own from crashes.
 
-The catch: a single big download on its own is still slower than with CAKE. My theory is that the controller is too
-aggressive with single connections.
+At first a single big download on its own was slower than with CAKE, because the controller cut too far on a lone
+connection. Setting the floor just under my line's normal speed (285 on the 300 line) fixed that: a single download now
+gets about 267 megabits, where CAKE gets about 244.
 
 It only touches downloads, which is where cable bloat really hurts. Upload stays on regular CAKE shaping, untouched.
 Software flow offloading stays on too, and the latency tracking still sees the offloaded traffic, so I didn't have to give
@@ -106,9 +107,12 @@ logread -e qdma-autorate                     # warnings and errors only
 
 ## Known limitations
 
-- **Single downloads:** a single bulk download gets about 140 Mbit/s, against about 244 with CAKE. The likely cause is that
-  the controller cuts too often on a lone flow.
-- **Idle:** at idle the rate sits at its 150 Mbit/s floor and ramps up within a few seconds once traffic starts.
+- **The floor is a tradeoff:** set `--floor` just under what your line reliably delivers (285 on a 300 Mbit/s line). With
+  a low floor (150) a single bulk download only got about 140 Mbit/s, because the controller cut too far on a lone flow. With
+  the floor at 285 it gets about 267, against about 244 with CAKE. The cost: the controller can never go below the floor. If
+  the line drops below it, for example at busy hours on cable, latency rises again until the line recovers. A fixed CAKE rate
+  just under the line speed has the same exposure.
+- **Idle:** at idle the rate tends to sit at the floor and ramps up within a few seconds once traffic starts.
 - **UDP/QUIC:** UDP/QUIC traffic gives no RTT samples. Only TCP flows drive the controller.
 - **Testing:** tested on one router and one ISP only.
 - **No XDP:** native XDP on the WAN interface (`eth1`) resets the link on this hardware, so this project uses tcx.
@@ -124,15 +128,19 @@ config qdma-autorate 'main'
 	option lan_dev 'eth0'
 	option queues '3,4,5,6,8'        # QDMA queues of the LAN ports (DSA port + 3)
 	option watchdog_ms '2000'
-	option args '--start 300 --floor 150 --ceil 380 --cut-thresh 10 --inc-thresh 5 --dec 0.95 --cut-cooldown-ms 400 --bind-backlog-frac 0.8 --probe-step 10 --probe-interval-ms 500 --fast-step 20'
+	option args '--start 300 --floor 285 --ceil 380 --cut-thresh 10 --inc-thresh 5 --dec 0.95 --cut-cooldown-ms 400 --bind-backlog-frac 0.8 --probe-step 10 --probe-interval-ms 500 --fast-step 20'
 ```
 
 Restart after a change: `service qdma-autorate restart`.
 
+**Set the floor for your line.** The package ships with `--floor 150` as a safe start. The example above is for a 300 Mbit/s
+line and uses `--floor 285`. The floor should sit just under the download speed your line reliably delivers (see Known
+limitations for the tradeoff).
+
 | Flag | Meaning |
 |---|---|
 | `--start` | rate in Mbit/s at start |
-| `--floor` | lowest rate the controller will set |
+| `--floor` | lowest rate the controller will set; put it just under what your line reliably delivers |
 | `--ceil` | highest rate (a safety bound; the rate only rises while the LAN queue is backlogged) |
 | `--cut-thresh` | cut the rate when the median per-flow delay exceeds this many ms |
 | `--inc-thresh` | only raise the rate while the delay is below this many ms |
@@ -143,11 +151,11 @@ Restart after a change: `service qdma-autorate restart`.
 
 `qdma-autorate -h` lists every flag.
 
-**Example for a gigabit line** (not tested by me): set the floor to about half the line rate, and the ceiling a bit
-above the speed you actually get:
+**Example for a gigabit line** (not tested by me): the floor just under what the line reliably delivers (here about 900),
+the ceiling a bit above the speed you actually get:
 
 ```
-	option args '--start 800 --floor 400 --ceil 1000 --cut-thresh 10 --inc-thresh 5'
+	option args '--start 900 --floor 880 --ceil 1000 --cut-thresh 10 --inc-thresh 5'
 ```
 
 The hardware encodes rates as MAN × 10^EXP kbit/s: 1 Mbit/s steps up to 127, 10 Mbit/s steps up to 1270, then 100 Mbit/s
