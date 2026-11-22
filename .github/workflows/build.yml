@@ -1,0 +1,55 @@
+name: build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: feed
+
+      - name: Self-tests (host)
+        run: |
+          cd feed/kmod/qdma-rl/src && cc -O2 -Wall -o /tmp/enc_test enc_test.c && /tmp/enc_test
+          cd "$GITHUB_WORKSPACE/feed/controller/qdma-autorate/src" && cc -O2 -Wall -Wextra -o /tmp/ctl_test ctl_test.c ctl.c -lm && /tmp/ctl_test
+          cd "$GITHUB_WORKSPACE/feed/controller/qdma-autorate/files" && sh -n qdma-autorate.init && sh -n qdma-autorate.hotplug
+
+      - run: mkdir -p out
+
+      - name: Build with OpenWrt SDK (25.12.6 mediatek/filogic)
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+        env:
+          ARCH: mediatek-filogic-25.12.6
+          FEED_DIR: ${{ github.workspace }}/feed
+          ARTIFACTS_DIR: ${{ github.workspace }}/out
+          PACKAGES: qdma-rl qdma-autorate
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          V: s
+
+      - name: Collect and check
+        run: |
+          mkdir -p dist
+          find out/bin -name 'kmod-qdma-rl*.apk' -exec cp {} dist/ ';'
+          find out/bin -name 'qdma-autorate-*.apk' -exec cp {} dist/ ';'
+          cp out/bin/qdma-rl/qdma_rl.ko out/bin/qdma-autorate/qdma-autorate out/bin/qdma-autorate/pping_kern.o dist/
+          cd dist
+          file qdma_rl.ko qdma-autorate pping_kern.o | tee file.txt
+          grep -q 'qdma_rl.ko: ELF 64-bit LSB relocatable, ARM aarch64' file.txt
+          grep -qE 'qdma-autorate: .*ARM aarch64.*(statically linked|static-pie)' file.txt
+          grep -q 'pping_kern.o: .*eBPF' file.txt
+          modinfo qdma_rl.ko | grep -q 'vermagic: *6.12.112 SMP mod_unload aarch64'
+          ! readelf -s -W pping_kern.o | grep -q __bpf_trap
+          ls kmod-qdma-rl-*.apk qdma-autorate-*.apk
+          rm file.txt
+          sha256sum * > sha256sums
+          cat sha256sums
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mt7986-qdma-autorate-25.12.6
+          path: dist/
