@@ -39,7 +39,7 @@ jobs:
           cp out/bin/qdma-rl/qdma_rl.ko out/bin/qdma-autorate/qdma-autorate out/bin/qdma-autorate/pping_kern.o dist/
           cd dist
           file qdma_rl.ko qdma-autorate pping_kern.o | tee file.txt
-          grep -q 'qdma_rl.ko: ELF 64-bit LSB relocatable, ARM aarch64' file.txt
+          grep -qE 'qdma_rl.ko: +ELF 64-bit LSB relocatable, ARM aarch64' file.txt
           grep -qE 'qdma-autorate: .*ARM aarch64.*(statically linked|static-pie)' file.txt
           grep -q 'pping_kern.o: .*eBPF' file.txt
           modinfo qdma_rl.ko | grep -q 'vermagic: *6.12.112 SMP mod_unload aarch64'
