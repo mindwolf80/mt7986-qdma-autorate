@@ -16,6 +16,22 @@ CTL_PATTERN='^/usr/sbin/qdma-autorate '
 
 log() { logger -t qdma-autorate -p "daemon.$1" "$2"; }
 
+# Set options in package $1 and commit them, but only if $1 has no pending changes: a commit takes every pending
+# change of the package (libuci merges /tmp/.uci even with -t), and this script must never persist someone
+# else's uncommitted edits. Usage: uci_own PKG SECTION.OPTION=VALUE...
+uci_own() {
+	local pkg="$1" kv
+	shift
+	if [ -n "$(uci -q changes "$pkg")" ]; then
+		log warn "uncommitted changes in /etc/config/$pkg, not changing it (commit or revert them, then restart): $*"
+		return 1
+	fi
+	for kv in "$@"; do
+		uci set "$pkg.$kv" || return 1
+	done
+	uci commit "$pkg"
+}
+
 load_cfg() {
 	config_load qdma-autorate
 	config_get_bool ENABLED main enabled 1
@@ -64,13 +80,10 @@ start_service() {
 	if [ -n "$sec" ]; then
 		if [ -z "$(uci -q get qdma-autorate.main.sqm_download_orig)" ]; then
 			cur=$(uci -q get "sqm.$sec.download")
-			uci set qdma-autorate.main.sqm_download_orig="${cur:-0}"
-			uci set qdma-autorate.main.sqm_section="$sec"
-			uci commit qdma-autorate
+			uci_own qdma-autorate main.sqm_download_orig="${cur:-0}" main.sqm_section="$sec" || return 1
 		fi
 		if [ "$(uci -q get "sqm.$sec.download")" != 0 ]; then
-			uci set "sqm.$sec.download=0"
-			uci commit sqm
+			uci_own sqm "$sec.download=0" || return 1
 			/etc/init.d/sqm restart
 		fi
 	fi
@@ -118,11 +131,13 @@ service_stopped() {
 	sec=$(uci -q get qdma-autorate.main.sqm_section)
 	orig=$(uci -q get qdma-autorate.main.sqm_download_orig)
 	if [ -n "$sec" ] && [ -n "$orig" ]; then
-		uci set "sqm.$sec.download=$orig"
-		uci commit sqm
-		uci set qdma-autorate.main.sqm_download_orig=''
-		uci set qdma-autorate.main.sqm_section=''
-		uci commit qdma-autorate
-		/etc/init.d/sqm restart
+		# the SQM restore must persist (start persisted download=0); it is the only config stop writes
+		if uci_own sqm "$sec.download=$orig"; then
+			/etc/init.d/sqm restart
+			# best effort: if skipped, the saved value stays and the next start reuses it
+			uci_own qdma-autorate main.sqm_download_orig='' main.sqm_section=''
+		else
+			log err "SQM download left at 0: restore it with: uci set sqm.$sec.download=$orig; uci commit sqm; /etc/init.d/sqm restart"
+		fi
 	fi
 }

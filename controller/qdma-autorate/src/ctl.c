@@ -3,7 +3,7 @@
 #include "ctl.h"
 
 const char *ctl_action_name[] = { "hold", "dec", "inc", "nosig", "holdoff", "cooldown", "inc_fast", "nobind",
-				  "probewait" };
+				  "probewait", "noload", "stale", "excess" };
 
 void bind_push(struct bind_hist *b, unsigned int window, bool backlog)
 {
@@ -65,7 +65,7 @@ void flow_add(struct flow_win *f, uint64_t now, uint64_t rtt)
 	f->last_ns = now;
 }
 
-bool flow_delta(const struct flow_win *f, const struct ctl_cfg *c, uint64_t now, double *delta_ms)
+bool flow_delta(const struct flow_win *f, const struct ctl_cfg *c, uint64_t now, double *delta_ms, double *cur_ms)
 {
 	uint64_t cur = UINT64_MAX, base = UINT64_MAX, b_now = now / BUCKET_NS;
 	uint64_t nb = c->base_ns / BUCKET_NS;
@@ -97,6 +97,8 @@ bool flow_delta(const struct flow_win *f, const struct ctl_cfg *c, uint64_t now,
 	if (base == UINT64_MAX || base > cur)
 		base = cur;
 	*delta_ms = (double)(cur - base) / NS_MS;
+	if (cur_ms)
+		*cur_ms = (double)cur / NS_MS;
 	return true;
 }
 
@@ -119,6 +121,12 @@ bool ctl_in_cooldown(const struct ctl_cfg *c, const struct ctl_state *s, uint64_
 	if (!s->last_cut || !c->cooldown_ns)	/* cooldown 0 = v1 behaviour: cut on every tick */
 		return false;
 	return now < s->last_cut + c->cooldown_ns || now < s->last_cut + c->cur_ns;
+}
+
+/* The ceiling in force: cfg ceil, raised by ceil creep; never below cfg ceil. */
+double ctl_ceil(const struct ctl_cfg *c, const struct ctl_state *s)
+{
+	return s->ceil > c->ceil ? s->ceil : c->ceil;
 }
 
 /* Increase by the fast step below the recovery target, the slow probe above it. */
@@ -176,39 +184,100 @@ static enum ctl_action increase_v4(const struct ctl_cfg *c, struct ctl_state *s,
 		s->last_probe = now;
 		a = ACT_INC;
 	}
-	if (s->rate > c->ceil)
-		s->rate = c->ceil;
+	if (s->rate > ctl_ceil(c, s))
+		s->rate = ctl_ceil(c, s);
 	s->rate = hw_rate(s->rate);
 	return a;
 }
 
-enum ctl_action ctl_step(const struct ctl_cfg *c, struct ctl_state *s, uint64_t now,
-			 bool have_signal, double signal_ms, double achieved, bool binding)
+/* Multiplicative cut from base, clamped to the floor; v4+ keeps rate and target on the hardware quantum. */
+static enum ctl_action cut(const struct ctl_cfg *c, struct ctl_state *s, uint64_t now, double base, bool v4)
 {
-	bool v4 = c->bind_backlog_frac > 0;
+	s->target = s->rate * c->target_frac;	/* a cut during fast recovery sets a new target */
+	s->rate = base * c->dec;
+	if (s->rate < c->floor)
+		s->rate = c->floor;
+	if (v4) {	/* stay on the hardware quantum, not below the floor */
+		s->target = hw_rate(s->target);
+		s->rate = hw_rate(s->rate);
+		if (s->rate < c->floor)
+			s->rate = c->floor;
+	}
+	s->last_cut = now;
+	s->holdoff_until = now + c->holdoff_ns;
+	return ACT_DEC;
+}
 
-	if (v4 && !(have_signal && signal_ms > c->hi_ms))
-		return increase_v4(c, s, now, have_signal, signal_ms, binding);
+/*
+ * v4/v5 rules (bind_backlog_frac > 0):
+ * - load gate: below load_gate * rate (1 s WAN rx) hold, whatever the signal, so light traffic never moves the rate;
+ * - stale: loaded but no ePPing sample for stale_ns -> floor, until samples return;
+ * - cut only when the excess-delay integral reaches cut_integral (a single splash above hi_ms does not cut),
+ *   from the current rate (the gate already guarantees real load), then the post-cut cooldown;
+ * - otherwise the v4 increase rule.
+ */
+static enum ctl_action step_v4(const struct ctl_cfg *c, struct ctl_state *s, uint64_t now, bool have_signal,
+			       double signal_ms, double achieved, bool binding, double load, uint64_t last_sample)
+{
+	double dt = s->last_step && now > s->last_step ? (double)(now - s->last_step) / 1e9 : 0;
+
+	s->last_step = now;
+	if (c->load_gate > 0 && load < c->load_gate * s->rate) {
+		s->integ = 0;
+		return ACT_NOLOAD;
+	}
+	if (c->stale_ns && now >= last_sample + c->stale_ns) {
+		s->integ = 0;
+		s->target = 0;
+		s->rate = c->floor;
+		s->stale = true;
+		return ACT_STALE;
+	}
+	s->stale = false;
+	/* ceil creep: pinned at the ceiling (on the quantum) with the signal under the cut threshold */
+	if (c->ceil_creep) {
+		if (have_signal && signal_ms < c->hi_ms && s->rate >= hw_rate(ctl_ceil(c, s))) {
+			if (!s->ceil_since)
+				s->ceil_since = now;
+			if (now - s->ceil_since >= CREEP_NS && (!s->ceil_raised || now - s->ceil_raised >= CREEP_NS)) {
+				s->ceil = ctl_ceil(c, s) * CREEP_FRAC;
+				s->ceil_raised = now;
+				s->ceil_since = now;	/* another 5 continuous minutes for the next raise */
+			}
+		} else {
+			s->ceil_since = 0;
+		}
+	}
+	if (have_signal) {	/* grows above hi_ms, decays toward 0 below it */
+		s->integ += (signal_ms - c->hi_ms) * dt;
+		if (s->integ < 0)
+			s->integ = 0;
+		if (c->cut_integral > 0 && s->integ > 2 * c->cut_integral)
+			s->integ = 2 * c->cut_integral;	/* bounded wind-up during the cooldown */
+	}
+	if (have_signal && signal_ms > c->hi_ms) {
+		if (c->cut_integral > 0 && s->integ < c->cut_integral)
+			return ACT_EXCESS;
+		if (ctl_in_cooldown(c, s, now))
+			return ACT_COOLDOWN;
+		s->integ = 0;
+		return cut(c, s, now, c->load_gate > 0 || s->rate < achieved ? s->rate : achieved, true);
+	}
+	return increase_v4(c, s, now, have_signal, signal_ms, binding);
+}
+
+enum ctl_action ctl_step(const struct ctl_cfg *c, struct ctl_state *s, uint64_t now,
+			 bool have_signal, double signal_ms, double achieved, bool binding,
+			 double load, uint64_t last_sample)
+{
+	if (c->bind_backlog_frac > 0)
+		return step_v4(c, s, now, have_signal, signal_ms, achieved, binding, load, last_sample);
 	if (!have_signal)
 		return ACT_NOSIG;	/* hold, whatever the utilisation */
 	if (signal_ms > c->hi_ms) {
-		double base = s->rate < achieved ? s->rate : achieved;
-
 		if (ctl_in_cooldown(c, s, now))
 			return ACT_COOLDOWN;
-		s->target = s->rate * c->target_frac;	/* a cut during fast recovery sets a new target */
-		s->rate = base * c->dec;
-		if (s->rate < c->floor)
-			s->rate = c->floor;
-		if (v4) {	/* stay on the hardware quantum, not below the floor */
-			s->target = hw_rate(s->target);
-			s->rate = hw_rate(s->rate);
-			if (s->rate < c->floor)
-				s->rate = c->floor;
-		}
-		s->last_cut = now;
-		s->holdoff_until = now + c->holdoff_ns;
-		return ACT_DEC;
+		return cut(c, s, now, s->rate < achieved ? s->rate : achieved, false);
 	}
 	if (signal_ms < c->lo_ms && achieved >= c->util * s->rate) {
 		if (now < s->holdoff_until)

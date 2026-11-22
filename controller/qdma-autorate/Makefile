@@ -1,9 +1,9 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=qdma-autorate
-PKG_VERSION:=4.0
-PKG_RELEASE:=2
-PKG_LICENSE:=GPL-2.0-only
+PKG_VERSION:=5.0
+PKG_RELEASE:=1
+PKG_LICENSE:=GPL-2.0-or-later
 PKG_BUILD_DEPENDS:=libbpf elfutils zlib
 
 include $(INCLUDE_DIR)/package.mk
@@ -31,7 +31,7 @@ define Build/Prepare
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 
-# BPF build for stock OpenWrt (no kernel BTF): no CO-RE, no __bpf_trap typed ksym (see NOTICE)
+# Same BPF build as mindwolf80/epping-owrt: no CO-RE, no __bpf_trap typed ksym (no kernel BTF on stock OpenWrt)
 define Build/Compile
 	$(CLANG) -target $(BPF_TARGET) -O2 -g -Wall -DPPING_NO_CORE \
 		-Wno-compare-distinct-pointer-types \

@@ -5,8 +5,8 @@
  * Detection: the patched ePPing BPF object (pping_kern.o, tcx ingress+egress on the WAN netdev)
  * reports per-flow TCP RTT samples through a ringbuf, consumed in-process.
  * Enforcement: writes the rate to qdma_rl's rate_mbps (QDMA per-queue max rate on the LAN queues).
- * Every 100 ms: per-flow delta = min RTT over 200 ms - min RTT over 30 s, for flows with >= 3 samples
- * in 500 ms; the signal is the median delta. The control law is in ctl.c.
+ * Every 100 ms: per-flow delta = min RTT over 100 ms - min RTT over 30 s, for flows with >= 3 samples
+ * in 300 ms; the signal is the median delta. The control law is in ctl.c.
  */
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -39,7 +40,10 @@ struct flow {
 
 static struct flow flows[MAX_FLOWS];
 static unsigned long n_rtt_events, n_map_full, n_flow_drop;
-static volatile sig_atomic_t stop;
+static uint64_t last_sample_ns;		/* newest ePPing RTT event (CLOCK_MONOTONIC) */
+static volatile sig_atomic_t stop, toggle_epping;
+#define LOAD_WIN_NS (1000 * NS_MS)	/* load gate averaging window */
+#define LOAD_MAX 64
 
 static uint64_t now_ns(clockid_t c)
 {
@@ -116,6 +120,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (e->event_type != EVENT_TYPE_RTT || size < sizeof(e->rtt_event))
 		return 0;
 	n_rtt_events++;
+	last_sample_ns = e->rtt_event.timestamp;
 	f = flow_get(&e->rtt_event.flow, true);
 	if (!f) {
 		n_flow_drop++;
@@ -221,7 +226,10 @@ static long long lan_backlog(int nl, int ifindex, uint32_t major, const char *ki
 
 static void on_signal(int sig)
 {
-	stop = 1;
+	if (sig == SIGUSR1)
+		toggle_epping = 1;	/* fault injection: detach / reattach ePPing */
+	else
+		stop = 1;
 }
 
 static int read_u64(int fd, uint64_t *v)
@@ -234,6 +242,33 @@ static int read_u64(int fd, uint64_t *v)
 	buf[n] = 0;
 	*v = strtoull(buf, NULL, 10);
 	return 0;
+}
+
+/* Once-per-second rate-vs-RTT log, rotated at LOG_MAX to PATH.1 (one old file kept). */
+#define LOG_MAX (1024 * 1024)
+static FILE *log_open(const char *path)
+{
+	FILE *f = fopen(path, "a");
+
+	if (f)
+		setvbuf(f, NULL, _IOLBF, 0);
+	return f;
+}
+
+static FILE *log_line(FILE *f, const char *path, const char *line)
+{
+	char old[256];
+
+	if (!f)
+		return NULL;
+	fputs(line, f);
+	if (ftell(f) >= LOG_MAX) {
+		fclose(f);
+		snprintf(old, sizeof(old), "%s.1", path);
+		rename(path, old);
+		f = log_open(path);
+	}
+	return f;
 }
 
 static int write_rate(int fd, int mbps)
@@ -255,7 +290,15 @@ static void usage(const char *p)
 		"  --start 300 --floor 150 --ceil 380 --tick-ms 100 --cut-thresh 10 --inc-thresh 5 --dec 0.95\n"
 		"  --inc-frac 0.002 --fast-frac 0.02 --target-frac 0.97 --cut-cooldown-ms 400 --util 0.8\n"
 		"  --holdoff-ms 300 --base-s 30 --cur-win-ms 100 --qual-ms 300 --min-samples 3\n"
-		"  --refresh-ms 1000 --sample-ms 10 (ePPing per-flow rate limit)\n"
+		"  --refresh-ms 300 --sample-ms 10 (ePPing per-flow rate limit)\n"
+		"  v5: --cut-integral-ms 1.0 (cut when the excess delay above --cut-thresh, integrated over time, reaches\n"
+		"      this many ms*s; 0 = cut on any tick above) --load-gate 0.5 (act only while the 1 s WAN rx rate is\n"
+		"      >= this x the cap, else hold; 0 = off) --stale-ms 2000 (loaded but no ePPing sample: floor; 0 = off)\n"
+		"  --cir MBPS      committed rate: floor = cir x --floor-pct (0.95), ceil = cir x --ceil-pct (1.25),\n"
+		"                  start = cir unless given; explicit --floor/--ceil/--start win\n"
+		"  --ceil-creep    +2%% ceiling after 5 min at it with delay under --cut-thresh, 5 min between raises (off)\n"
+		"  --log PATH      1 s rate-vs-RTT log (/tmp/qdma-autorate.log, rotated at 1 MB to PATH.1; - = off)\n"
+		"  SIGUSR1 detaches ePPing (no samples), a second SIGUSR1 reattaches it (stale-path test)\n"
 		"  v4: --bind-backlog-frac 0.8 --bind-window-ms 500 (cap binding = LAN backlog > 0 on >= frac of ticks;\n"
 		"      0 = v2 rules) --probe-step 10 --probe-interval-ms 500 --fast-step 20 (Mbit/s per tick)\n"
 		"      --lan-dev eth0 --lan-parent 1 --lan-kind cake (qdiscs whose backlog is summed)\n"
@@ -266,14 +309,15 @@ static void usage(const char *p)
 
 int main(int argc, char **argv)
 {
-	/* v2/v4 defaults; v1 behaviour: --inc-frac 0.01 --inc-thresh 3 --cur-win-ms 200 --qual-ms 500
+	/* v2 defaults; v1 behaviour: --inc-frac 0.01 --inc-thresh 3 --cur-win-ms 200 --qual-ms 500
 	 * --fast-frac 0 --cut-cooldown-ms 0 */
 	struct ctl_cfg c = { .start = 300, .floor = 150, .ceil = 380, .hi_ms = 10, .lo_ms = 5, .dec = 0.95,
 			     .inc_frac = 0.002, .util = 0.8, .holdoff_ns = 300 * NS_MS, .base_ns = 30000 * NS_MS,
 			     .cur_ns = 100 * NS_MS, .qual_ns = 300 * NS_MS, .min_samples = 3,
 			     .fast_frac = 0.02, .target_frac = 0.97, .cooldown_ns = 400 * NS_MS,
 			     .bind_backlog_frac = 0.8, .probe_step = 10, .fast_step = 20,
-			     .probe_interval_ns = 500 * NS_MS };	/* v4; --bind-backlog-frac 0 = v2 rules */
+			     .probe_interval_ns = 500 * NS_MS,	/* v4; --bind-backlog-frac 0 = v2 rules */
+			     .cut_integral = 1.0, .load_gate = 0.5, .stale_ns = 2000 * NS_MS };	/* v5 */
 	const char *lan_dev = "eth0", *lan_kind = "cake";
 	unsigned int lan_major = 1;
 	double bind_window_ms = 500;
@@ -283,7 +327,7 @@ int main(int argc, char **argv)
 	const char *csv_path = NULL;	/* --csv PATH: per-tick CSV for debugging (off by default) */
 	bool verbose = false;
 	uint64_t last_warn = 0;
-	double tick_ms = 100, refresh_ms = 1000, sample_ms = 10, duration_s = 0, ts_max_age_ms = 2000;
+	double tick_ms = 100, refresh_ms = 300, sample_ms = 10, duration_s = 0, ts_max_age_ms = 2000;
 	bool pure_acks = true;
 	int ts_map_fd;
 	uint64_t next_clean;
@@ -295,6 +339,15 @@ int main(int argc, char **argv)
 	struct ctl_state s;
 	int ifindex, link_in = -1, link_eg = -1, rate_fd = -1, rx_fd, err, opt, last_written = -1;
 	uint64_t t_start, next_tick, last_write_ns = 0, rx_prev, rx_now, t_prev;
+	uint64_t load_rx[LOAD_MAX], load_t[LOAD_MAX];
+	unsigned int load_n, load_head = 0, load_cnt = 0;
+	int prog_in, prog_eg;
+	bool was_stale = false, floor_set = false, ceil_set = false, start_set = false;
+	double cir = 0, floor_pct = 0.95, ceil_pct = 1.25, last_ceil = 0;
+	const char *log_path = "/tmp/qdma-autorate.log";
+	FILE *logf = NULL;
+	uint64_t next_log;
+	static double curs[MAX_FLOWS];
 	FILE *csv;
 	char path[128];
 	static double deltas[MAX_FLOWS];
@@ -309,6 +362,9 @@ int main(int argc, char **argv)
 		{ "bind-backlog-frac", 1, 0, 24 }, { "probe-step", 1, 0, 25 }, { "probe-interval-ms", 1, 0, 26 },
 		{ "fast-step", 1, 0, 27 }, { "bind-window-ms", 1, 0, 28 }, { "lan-dev", 1, 0, 29 },
 		{ "lan-parent", 1, 0, 30 }, { "lan-kind", 1, 0, 31 },
+		{ "cut-integral-ms", 1, 0, 32 }, { "load-gate", 1, 0, 33 }, { "stale-ms", 1, 0, 34 },
+		{ "cir", 1, 0, 35 }, { "floor-pct", 1, 0, 36 }, { "ceil-pct", 1, 0, 37 }, { "ceil-creep", 0, 0, 38 },
+		{ "log", 1, 0, 39 },
 		{ "csv", 1, 0, 'w' }, { "help", 0, 0, 'h' }, { 0 }
 	};
 
@@ -322,9 +378,9 @@ int main(int argc, char **argv)
 		case 'w': csv_path = optarg; break;
 		case 'd': duration_s = v; break;
 		case 'v': verbose = true; break;
-		case 1: c.start = v; break;
-		case 2: c.floor = v; break;
-		case 3: c.ceil = v; break;
+		case 1: c.start = v; start_set = true; break;
+		case 2: c.floor = v; floor_set = true; break;
+		case 3: c.ceil = v; ceil_set = true; break;
 		case 4: tick_ms = v; break;
 		case 5: c.hi_ms = v; break;
 		case 6: c.lo_ms = v; break;
@@ -351,14 +407,35 @@ int main(int argc, char **argv)
 		case 29: lan_dev = optarg; break;
 		case 30: lan_major = (unsigned int)v; break;
 		case 31: lan_kind = optarg; break;
+		case 32: c.cut_integral = v; break;
+		case 33: c.load_gate = v; break;
+		case 34: c.stale_ns = v * NS_MS; break;
+		case 35: cir = v; break;
+		case 36: floor_pct = v; break;
+		case 37: ceil_pct = v; break;
+		case 38: c.ceil_creep = true; break;
+		case 39: log_path = optarg; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
+	}
+	if (cir < 0 || floor_pct <= 0 || ceil_pct < floor_pct) {
+		fprintf(stderr, "invalid parameters\n");
+		return 1;
+	}
+	if (cir > 0) {	/* explicit --floor/--ceil/--start override the CIR-derived values */
+		if (!floor_set)
+			c.floor = cir * floor_pct;
+		if (!ceil_set)
+			c.ceil = cir * ceil_pct;
+		if (!start_set)
+			c.start = cir;
 	}
 	if (c.floor <= 0 || c.ceil < c.floor || c.start < c.floor || c.start > c.ceil || tick_ms < 10 ||
 	    c.base_ns / BUCKET_NS > MAX_BUCKETS || c.dec <= 0 || c.dec >= 1 || c.lo_ms > c.hi_ms ||
 	    c.fast_frac < 0 || c.target_frac <= 0 || c.target_frac > 1 || c.bind_backlog_frac < 0 ||
 	    c.bind_backlog_frac > 1 || c.probe_step <= 0 || c.fast_step <= 0 ||
-	    bind_window_ms / tick_ms < 1 || bind_window_ms / tick_ms > BIND_MAX) {
+	    bind_window_ms / tick_ms < 1 || bind_window_ms / tick_ms > BIND_MAX ||
+	    c.cut_integral < 0 || c.load_gate < 0 || c.load_gate > 1 || 1000 / tick_ms > LOAD_MAX - 1) {
 		fprintf(stderr, "invalid parameters\n");
 		return 1;
 	}
@@ -386,9 +463,14 @@ int main(int argc, char **argv)
 	{
 		struct bpf_map *m;
 
-		bpf_object__for_each_map(m, obj)
+		bpf_object__for_each_map(m, obj) {
 			if (strstr(bpf_map__name(m), ".rodata"))
 				bpf_map__set_initial_value(m, &bc, sizeof(bc));
+			/* RTT aggregation is off (agg_rtts = false): its four preallocated per-CPU maps would hold about
+			 * 0.5 GB of kernel memory on the 1 GB router for nothing; one entry each keeps the programs valid. */
+			if (!strncmp(bpf_map__name(m), "map_v4_agg", 10) || !strncmp(bpf_map__name(m), "map_v6_agg", 10))
+				bpf_map__set_max_entries(m, 1);
+		}
 	}
 	/* Only the tc programs: the XDP program is unused and the iterators need kernel BTF. */
 	bpf_object__for_each_program(prog, obj)
@@ -401,10 +483,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	err = 1;	/* until the main loop finishes cleanly */
-	link_in = bpf_link_create(bpf_program__fd(bpf_object__find_program_by_name(obj, "pping_tc_ingress")),
-				  ifindex, BPF_TCX_INGRESS, NULL);
-	link_eg = bpf_link_create(bpf_program__fd(bpf_object__find_program_by_name(obj, "pping_tc_egress")),
-				  ifindex, BPF_TCX_EGRESS, NULL);
+	prog_in = bpf_program__fd(bpf_object__find_program_by_name(obj, "pping_tc_ingress"));
+	prog_eg = bpf_program__fd(bpf_object__find_program_by_name(obj, "pping_tc_egress"));
+	link_in = bpf_link_create(prog_in, ifindex, BPF_TCX_INGRESS, NULL);
+	link_eg = bpf_link_create(prog_eg, ifindex, BPF_TCX_EGRESS, NULL);
 	if (link_in < 0 || link_eg < 0) {
 		fprintf(stderr, "tcx attach on %s failed: %d %d\n", ifname, link_in, link_eg);
 		goto out;
@@ -443,30 +525,44 @@ int main(int argc, char **argv)
 		fprintf(stderr, "open %s: %s\n", csv_path, strerror(errno));
 		goto out;
 	}
+	if (!strcmp(log_path, "-"))
+		log_path = "";
+	if (*log_path && !(logf = log_open(log_path))) {
+		fprintf(stderr, "open %s: %s\n", log_path, strerror(errno));
+		goto out;
+	}
 	if (csv)
-		fprintf(csv, "t_mono_s,t_epoch,rate,written,achieved,signal_ms,n_flows,action,rtt_events,map_full,flow_drop,write_err,ts_cleaned,target,cooldown,hw_rate,backlog,binding\n");
+		fprintf(csv, "t_mono_s,t_epoch,rate,written,achieved,signal_ms,n_flows,action,rtt_events,map_full,flow_drop,write_err,ts_cleaned,target,cooldown,hw_rate,backlog,binding,load,integ,stale\n");
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	signal(SIGUSR1, on_signal);
 	memset(&s, 0, sizeof(s));
 	s.rate = c.start;
 	t_start = t_prev = now_ns(CLOCK_MONOTONIC);
+	last_sample_ns = t_start;
+	next_log = t_start + 1000 * NS_MS;
+	load_n = (unsigned int)(1000 / tick_ms + 0.5) + 1;	/* samples spanning 1 s */
 	next_tick = t_start + tick_ms * NS_MS;
 	next_clean = t_start + 1000 * NS_MS;
 	if (verbose)
 		fprintf(stderr, "qdma-autorate: %s ifindex %d, tcx links %d/%d, start %.0f floor %.0f ceil %.0f, cut>%.1f inc<%.1f ms, "
 		"cooldown %llu ms, cur %llu qual %llu ms, v4 %s (backlog %s %s 1:, frac %.2f/%.0f ms, probe %.0f/%llu ms, fast %.0f), "
-		"pure ACKs %s, writing %s\n",
+		"pure ACKs %s, refresh %.0f ms, v5 cut-integral %.2f ms*s load-gate %.2f stale %llu ms cir %.0f "
+		"ceil-creep %s, log %s, writing %s\n",
 		ifname, ifindex, link_in, link_eg, c.start, c.floor, c.ceil, c.hi_ms, c.lo_ms,
 		(unsigned long long)(c.cooldown_ns / NS_MS), (unsigned long long)(c.cur_ns / NS_MS),
 		(unsigned long long)(c.qual_ns / NS_MS), c.bind_backlog_frac > 0 ? "on" : "off", lan_dev, lan_kind,
 		c.bind_backlog_frac, bind_window_ms, c.probe_step, (unsigned long long)(c.probe_interval_ns / NS_MS),
-		c.fast_step, pure_acks ? "on" : "off", rate_fd >= 0 ? rate_path : "(dry run)");
+		c.fast_step, pure_acks ? "on" : "off", refresh_ms, c.cut_integral, c.load_gate,
+		(unsigned long long)(c.stale_ns / NS_MS), cir, c.ceil_creep ? "on" : "off", *log_path ? log_path : "off",
+		rate_fd >= 0 ? rate_path : "(dry run)");
 
 	while (!stop) {
 		uint64_t now = now_ns(CLOCK_MONOTONIC);
 		int wait = now >= next_tick ? 0 : (int)((next_tick - now) / NS_MS) + 1, n = 0, i, werr = 0, want;
-		double achieved, signal_ms = 0;
+		double achieved, load, signal_ms = 0;
+		unsigned int oldest;
 		long long backlog;
 		bool binding;
 		enum ctl_action act;
@@ -477,6 +573,19 @@ int main(int argc, char **argv)
 			break;
 		}
 		now = now_ns(CLOCK_MONOTONIC);
+		if (toggle_epping) {
+			toggle_epping = 0;
+			if (link_in >= 0) {
+				close(link_in);
+				close(link_eg);
+				link_in = link_eg = -1;
+				fprintf(stderr, "qdma-autorate: SIGUSR1: ePPing detached\n");
+			} else {
+				link_in = bpf_link_create(prog_in, ifindex, BPF_TCX_INGRESS, NULL);
+				link_eg = bpf_link_create(prog_eg, ifindex, BPF_TCX_EGRESS, NULL);
+				fprintf(stderr, "qdma-autorate: SIGUSR1: ePPing reattached (%d %d)\n", link_in, link_eg);
+			}
+		}
 		if (now < next_tick)
 			continue;
 		next_tick += tick_ms * NS_MS;
@@ -491,6 +600,14 @@ int main(int argc, char **argv)
 		achieved = (double)(rx_now - rx_prev) * 8 * 1000 / (now - t_prev);	/* Mbit/s */
 		rx_prev = rx_now;
 		t_prev = now;
+		/* load: WAN rx over the last ~1 s (shorter until the history fills) */
+		load_rx[load_head] = rx_now;
+		load_t[load_head] = now;
+		load_head = (load_head + 1) % load_n;
+		if (load_cnt < load_n)
+			load_cnt++;
+		oldest = load_cnt < load_n ? 0 : load_head;
+		load = now > load_t[oldest] ? (double)(rx_now - load_rx[oldest]) * 8 * 1000 / (now - load_t[oldest]) : achieved;
 
 		for (i = 0; i < MAX_FLOWS; i++) {
 			struct flow *f = &flows[i];
@@ -501,19 +618,46 @@ int main(int argc, char **argv)
 				f->used = false;
 				continue;
 			}
-			if (flow_delta(&f->w, &c, now, &deltas[n]))
+			if (flow_delta(&f->w, &c, now, &deltas[n], &curs[n]))
 				n++;
 		}
 		if (n)
-			signal_ms = median(deltas, n);
+			signal_ms = median(deltas, n);	/* median() sorts: deltas and curs are not paired afterwards */
 		backlog = nl >= 0 ? lan_backlog(nl, lan_ifindex, lan_major, lan_kind) : 0;
 		if (nl >= 0)
 			bind_push(&bh, (unsigned int)(bind_window_ms / tick_ms + 0.5), backlog > 0);
 		binding = nl >= 0 && bind_binding(&bh, c.bind_backlog_frac);
-		act = ctl_step(&c, &s, now, n > 0, signal_ms, achieved, binding);
+		act = ctl_step(&c, &s, now, n > 0, signal_ms, achieved, binding, load, last_sample_ns);
+		if (ctl_ceil(&c, &s) != last_ceil) {
+			if (last_ceil)
+				fprintf(stderr, "qdma-autorate: ceil creep: ceiling %.1f -> %.1f Mbit/s\n", last_ceil, ctl_ceil(&c, &s));
+			last_ceil = ctl_ceil(&c, &s);
+		}
+		if (logf && now >= next_log) {
+			char line[256], ts[32];
+			time_t wall = time(NULL);
+
+			strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&wall));
+			if (n)
+				snprintf(line, sizeof(line), "%s rate=%d rtt_ms=%.1f delay_ms=%.1f rx_mbps=%.1f flows=%d ceil=%.1f action=%s\n",
+					 ts, last_written, median(curs, n), signal_ms, load, n, ctl_ceil(&c, &s), ctl_action_name[act]);
+			else
+				snprintf(line, sizeof(line), "%s rate=%d rtt_ms=- delay_ms=- rx_mbps=%.1f flows=0 ceil=%.1f action=%s\n",
+					 ts, last_written, load, ctl_ceil(&c, &s), ctl_action_name[act]);
+			logf = log_line(logf, log_path, line);
+			next_log += 1000 * NS_MS;
+			if (next_log < now)
+				next_log = now + 1000 * NS_MS;
+		}
+		if (s.stale != was_stale) {
+			fprintf(stderr, s.stale ? "qdma-autorate: stale-samples -> floor (%.0f Mbit/s)\n"
+						: "qdma-autorate: samples back, normal control from %.0f Mbit/s\n", s.rate);
+			was_stale = s.stale;
+		}
 
 		want = (int)s.rate;
-		if (rate_fd >= 0 && (want != last_written || now - last_write_ns >= refresh_ms * NS_MS)) {
+		/* half a tick of slack: tick jitter must not push a 300 ms refresh to 400 ms */
+		if (rate_fd >= 0 && (want != last_written || now - last_write_ns + tick_ms * NS_MS / 2 >= refresh_ms * NS_MS)) {
 			werr = write_rate(rate_fd, want);
 			if (!werr) {
 				last_written = want;
@@ -532,15 +676,17 @@ int main(int argc, char **argv)
 			s.rate, last_written, achieved);
 		if (n)
 			fprintf(csv, "%.2f", signal_ms);
-		fprintf(csv, ",%d,%s,%lu,%lu,%lu,%d,%lu,%.2f,%d,%.0f,%lld,%d\n", n, ctl_action_name[act], n_rtt_events,
-			n_map_full, n_flow_drop, werr, n_ts_cleaned, s.target, ctl_in_cooldown(&c, &s, now),
-			hw_rate(s.rate), backlog, binding);
+		fprintf(csv, ",%d,%s,%lu,%lu,%lu,%d,%lu,%.2f,%d,%.0f,%lld,%d,%.1f,%.3f,%d\n", n, ctl_action_name[act],
+			n_rtt_events, n_map_full, n_flow_drop, werr, n_ts_cleaned, s.target, ctl_in_cooldown(&c, &s, now),
+			hw_rate(s.rate), backlog, binding, load, s.integ, s.stale);
 tick_done:
 		if (duration_s > 0 && now - t_start >= duration_s * 1e9)
 			break;
 	}
 	if (csv)
 		fclose(csv);
+	if (logf)
+		fclose(logf);
 	err = 0;
 out:
 	/* Fail open: restore the original rates, then detach. */

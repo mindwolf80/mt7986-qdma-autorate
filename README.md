@@ -27,6 +27,10 @@ it's mostly idle, but if I switch back to plain CAKE it goes right back to work.
 
 The line is 300/30 DOCSIS cable. With no shaping at all, download latency went up by about 205 ms. (November 2026)
 
+**v5 measured (same line):** 8-stream load, 329 Mbit/s, ping p99 38.6 ms, 0 watchdog trips. Single stream, 247–280 Mbit/s
+depending on CDN path, 0 watchdog trips. Idle no longer collapses to the floor. Missing ePPing samples under load drive
+the rate to the floor within 2.06 s, and recover once samples resume.
+
 ## Requirements
 
 - **Router:** GL.iNet GL-MT6000 (MT7986).
@@ -40,7 +44,8 @@ The line is 300/30 DOCSIS cable. With no shaping at all, download latency went u
 ## How it works
 
 - **Measuring:** a tcx BPF program on the WAN interface (ePPing, patched; see [NOTICE](NOTICE)) measures per-flow TCP
-  round-trip time passively from normal traffic, including from pure ACKs.
+  round-trip time passively from normal traffic, including from pure ACKs. ePPing's RTT-aggregation maps are capped at
+  1 entry (aggregation is unused here), fixing a ~0.5 GB fixed preallocation that otherwise sits in `Percpu`/`vmalloc`.
 - **Controlling:**
   - The controller (`qdma-autorate`) lowers the rate when the median per-flow delay rises above 10 ms.
   - It raises the rate only while the LAN queue actually has a backlog, in 10 Mbit/s hardware steps: one step at most every
@@ -112,10 +117,13 @@ logread -e qdma-autorate                     # warnings and errors only
   the floor at 285 it gets about 267, against about 244 with CAKE. The cost: the controller can never go below the floor. If
   the line drops below it, for example at busy hours on cable, latency rises again until the line recovers. A fixed CAKE rate
   just under the line speed has the same exposure.
-- **Idle:** at idle the rate tends to sit at the floor and ramps up within a few seconds once traffic starts.
+- **Idle:** v5 no longer collapses to the floor at idle; the rate holds while the load gate is closed (`noload`) and ramps
+  up within a few seconds once traffic starts.
 - **UDP/QUIC:** UDP/QUIC traffic gives no RTT samples. Only TCP flows drive the controller.
-- **Testing:** tested on one router and one ISP only.
+- **Testing:** tested on one router and one ISP only (300/30 DOCSIS cable).
 - **No XDP:** native XDP on the WAN interface (`eth1`) resets the link on this hardware, so this project uses tcx.
+- **Wired only:** Wi-Fi and software/WED-offloaded traffic doesn't pass through the QDMA queues this shapes.
+- **PPPoE is not supported.**
 
 ## Settings
 
@@ -127,11 +135,15 @@ config qdma-autorate 'main'
 	option wan 'wan'
 	option lan_dev 'eth0'
 	option queues '3,4,5,6,8'        # QDMA queues of the LAN ports (DSA port + 3)
-	option watchdog_ms '2000'
-	option args '--start 300 --floor 285 --ceil 380 --cut-thresh 10 --inc-thresh 5 --dec 0.95 --cut-cooldown-ms 400 --bind-backlog-frac 0.8 --probe-step 10 --probe-interval-ms 500 --fast-step 20'
+	option watchdog_ms '1000'
+	option args '--cir 300 --cut-integral-ms 1.0 --load-gate 0.5 --stale-ms 2000 --refresh-ms 300'
 ```
 
 Restart after a change: `service qdma-autorate restart`.
+
+**v5:** `watchdog_ms=1000` is now the recommended setting (300 ms refresh keeps the module fed well inside the watchdog
+window; measured zero trips under load). `--cir` is the simplest way to set start/floor/ceil together; the flags below it
+are the v5 built-in defaults shown explicitly, so you don't need to pass them unless you want a different value.
 
 **Set the floor for your line.** The package ships with `--floor 150` as a safe start. The example above is for a 300 Mbit/s
 line and uses `--floor 285`. The floor should sit just under the download speed your line reliably delivers (see Known
@@ -148,6 +160,13 @@ limitations for the tradeoff).
 | `--probe-step`, `--probe-interval-ms` | slow increase: this many Mbit/s at most once per interval |
 | `--fast-step` | increase per 100 ms tick when recovering after a cut |
 | `--csv PATH` | write a per-tick CSV for debugging (off by default) |
+| `--cir MBPS` | committed rate: floor = CIR × `--floor-pct` (0.95), ceil = CIR × `--ceil-pct` (1.25), start = CIR unless given; explicit `--floor`/`--ceil`/`--start` win |
+| `--cut-integral-ms` | cut only once the excess delay above `--cut-thresh`, integrated over time, reaches this many ms·s; ignores short splashes (default `1.0`, 0 = cut on any tick above) |
+| `--load-gate` | act only while the 1 s WAN rx rate is at least this fraction of the cap, else hold (default `0.5`, 0 = off) |
+| `--stale-ms` | loaded but no ePPing RTT sample for this long → floor, until samples resume (default `2000`, 0 = off) |
+| `--refresh-ms` | minimum interval between rate writes to the kernel module (default `300`) |
+| `--log PATH` | write a once-a-second rate/RTT line (`rate`, `rtt_ms`, `delay_ms`, `rx_mbps`, `flows`, `ceil`, `action`), rotating at 1 MB with one old file kept (`-` = off) |
+| `--ceil-creep` | after 5 continuous minutes pinned at the ceiling with delay under `--cut-thresh`, raise the ceiling by 2%; never below the configured ceiling; off by default |
 
 `qdma-autorate -h` lists every flag.
 
