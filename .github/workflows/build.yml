@@ -3,14 +3,22 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish as a release (e.g. v5.0); empty = build only'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           path: feed
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Self-tests (host)
         run: |
@@ -53,3 +61,17 @@ jobs:
         with:
           name: mt7986-qdma-autorate-25.12.6
           path: dist/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cd dist
+          notes="Prebuilt for OpenWrt 25.12.6 mediatek/filogic (GL-MT6000 / Flint 2), kernel 6.12.112. Other releases: rebuild with that release's SDK. Verify with: sha256sum -c sha256sums"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber ./*
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG (OpenWrt 25.12.6)" --notes "$notes" ./*
+          fi
